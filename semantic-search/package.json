@@ -1,0 +1,17 @@
+{
+  "name": "semantic-search-extension",
+  "version": "1.0.0",
+  "description": "Semantic codebase search with sub-agent processing",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.56.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
