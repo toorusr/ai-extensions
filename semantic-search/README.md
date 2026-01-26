@@ -1,18 +1,79 @@
-# semantic-search extension
+# pi-search-agent extension
+
+## Overview
+
+`pi-search-agent` adds local semantic search to pi. It builds a semantic index of your codebase, runs embedding-based retrieval, and uses a configurable LLM to filter and summarize results via a search subagent.
+
+## First-time setup
+
+On first run you will be prompted (via UI) to:
+1. Enter your `OPENAI_API_KEY` (used for embeddings).
+2. Choose a search model (recommended: **cerebras / glm-4.7**).
+
+Configuration is stored in:
+```
+~/.pi/extensions/pi-search-agent/.env
+```
+
+You can edit the file manually later. Supported keys:
+- `OPENAI_API_KEY`
+- `SEARCH_PROVIDER` (e.g. `cerebras`, `openai`)
+- `SEARCH_MODEL` (e.g. `glm-4.7`, `gpt-4o-mini`)
 
 ## Tools
 
-- local_semantic_search(query, path?, mode?, logSubagent?)
-  - Embedding search preview plus a search subagent that can refine results.
-- local_embedding_search(query, path?, mode?)
-  - Embedding search only (one result per file).
-- local_rg(pattern, path?, maxMatches?, contextLines?)
-  - Read-only ripgrep-style search.
+### `search_agent(query, cwd?, queryExtrapolation?, path?, mode?, logSubagent?)`
+Search locally and run a subagent to refine results.
+
+- **query**: natural language search query
+- **cwd**: directory to search (defaults to current workspace)
+- **queryExtrapolation**: additional queries to run and merge
+- **path**: optional filter (file/dir/glob/substring)
+- **mode**: currently ignored (defaults to `code`)
+- **logSubagent**: writes JSON log to disk when true
+
+Example:
+```
+search_agent(query: "How do we authenticate API requests?", path: "src", logSubagent: true)
+```
+
+### `local_embedding_search(query, cwd?, path?, mode?)`
+Run embedding search only (one result per file).
+
+Example:
+```
+local_embedding_search(query: "retry logic", path: "packages/api")
+```
+
+## How it works
+
+1. **File discovery**: streams `find` results and yields to the event loop to avoid blocking the UI.
+2. **Chunking**: files are split into overlapping chunks for stable embeddings.
+3. **Embeddings**: generated with OpenAI (`text-embedding-3-small`) and cached on disk.
+4. **Index storage**: index metadata + chunks are persisted per-cwd.
+5. **Search pipeline**:
+   - embedding matches → merged per file
+   - subagent refines results and provides a concise answer
+6. **Summaries / filtering**: uses the configured `SEARCH_PROVIDER` + `SEARCH_MODEL`.
+
+## Data locations
+
+- **Index**: `~/.pi/agent/cache/semantic-search/<hash>/`
+- **Embedding cache**: `~/.pi/agent/cache/semantic-search/embeddings/`
+- **Subagent logs** (when enabled): `~/.pi/agent/cache/semantic-search/subagent-logs/`
+
+## Legacy tools / UI
+
+Legacy tools are disabled by default. Enable them with:
+```
+PI_SEMANTIC_LEGACY=1
+```
+This re-enables:
+- `semantic_index`, `semantic_search`
+- `/semantic` interactive UI
 
 ## Notes
 
-- mode is accepted but currently ignored; "code" includes markdown. TODO: split docs/code handling.
-- path follows ripgrep-style usage (file or directory). If the path does not exist, the tool falls back to simple glob or substring matching.
-- Indexing is per-cwd. If no index exists, a full index is created and path only filters results.
-- logSubagent writes the JSON event stream to ~/.pi/agent/cache/semantic-search/subagent-logs and returns the log path.
-- Legacy tools (semantic_index, semantic_search, /semantic) are disabled by default. Set PI_SEMANTIC_LEGACY=1 to re-enable.
+- `mode` is accepted but currently ignored; `code` includes markdown.
+- Indexing is per-cwd. If no index exists, it is created automatically.
+- The recommended search model is **cerebras / glm-4.7**.

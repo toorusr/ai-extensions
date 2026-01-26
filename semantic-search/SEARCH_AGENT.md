@@ -8,12 +8,11 @@ Goals:
 
 Tools:
 - local_embedding_search: semantic preview, one result per file
-- local_rg: ripgrep-style text search (use only when explicitly asked for exact matches)
 - read: file reads
 
 Constraints:
 - Read-only. Do not attempt to modify files or write patches.
-- Prefer local_embedding_search first; use local_rg only when explicitly asked for exact identifiers.
+- Prefer local_embedding_search first; read files only when needed.
 - Keep output concise.
 
 Output format:

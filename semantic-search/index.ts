@@ -11,32 +11,54 @@
  * - Progress tracking and status indicators
  */
 
-import { exec, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import * as dotenv from "dotenv";
 
 // Load extension-specific .env file into isolated config (doesn't touch process.env)
 const __extensionDir = path.dirname(fileURLToPath(import.meta.url));
-const extensionEnv: Record<string, string> = (() => {
-  const envPath = path.join(__extensionDir, ".env");
-  if (fs.existsSync(envPath)) {
-    return dotenv.parse(fs.readFileSync(envPath));
+const ENV_DIR = path.join(os.homedir(), ".pi", "extensions", "pi-search-agent");
+const ENV_PATH = path.join(ENV_DIR, ".env");
+const ENV_OPENAI_KEY = "OPENAI_API_KEY";
+const ENV_SEARCH_PROVIDER = "SEARCH_PROVIDER";
+const ENV_SEARCH_MODEL = "SEARCH_MODEL";
+
+const loadExtensionEnv = (): Record<string, string> => {
+  if (fs.existsSync(ENV_PATH)) {
+    return dotenv.parse(fs.readFileSync(ENV_PATH));
   }
   return {};
-})();
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  formatSize,
-  truncateHead
-} from "@mariozechner/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext, TruncationResult } from "@mariozechner/pi-coding-agent";
+};
+
+const writeExtensionEnv = (env: Record<string, string>): void => {
+  const orderedKeys = [
+    ENV_OPENAI_KEY,
+    ENV_SEARCH_PROVIDER,
+    ENV_SEARCH_MODEL,
+    ...Object.keys(env)
+      .filter((key) => ![ENV_OPENAI_KEY, ENV_SEARCH_PROVIDER, ENV_SEARCH_MODEL].includes(key))
+      .sort()
+  ];
+
+  const lines = orderedKeys
+    .filter((key) => env[key] !== undefined && env[key] !== null)
+    .map((key) => `${key}=${env[key] ?? ""}`);
+
+  if (!fs.existsSync(ENV_DIR)) {
+    fs.mkdirSync(ENV_DIR, { recursive: true });
+  }
+
+  fs.writeFileSync(ENV_PATH, `${lines.join("\n")}\n`, "utf-8");
+};
+
+let extensionEnv = loadExtensionEnv();
+
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   Container,
@@ -92,13 +114,6 @@ interface UsageTotals {
   cacheRead: number;
   cacheWrite: number;
   totalCost: number;
-}
-
-interface LocalRgDetails {
-  pattern: string;
-  path?: string;
-  truncation?: TruncationResult;
-  fullOutputPath?: string;
 }
 
 interface EmbeddingCache {
@@ -219,7 +234,25 @@ const MAX_FILTER_TOTAL_CHARS = 800; // Cap total prompt content per file
 const MAX_SUMMARY_FILES = 6; // Cap files sent to summary model
 const MAX_SUMMARY_CHARS_PER_FILE = 1200; // Cap summary context per file
 const DEFAULT_PROVIDER = 'cerebras'; // Provider for parallel filtering
-const DEFAULT_MODEL = 'zai-glm-4.7'; // Fast GLM model via cerebras
+const DEFAULT_MODEL = 'glm-4.7'; // Fast GLM model via cerebras
+const DISCOVERY_PROGRESS_EVERY = 200;
+const CHUNK_YIELD_EVERY = 25;
+
+let configuredSearchProvider = extensionEnv[ENV_SEARCH_PROVIDER]?.trim() || "";
+let configuredSearchModel = extensionEnv[ENV_SEARCH_MODEL]?.trim() || "";
+
+const syncSearchSettingsFromEnv = (): void => {
+  configuredSearchProvider = extensionEnv[ENV_SEARCH_PROVIDER]?.trim() || "";
+  configuredSearchModel = extensionEnv[ENV_SEARCH_MODEL]?.trim() || "";
+};
+
+syncSearchSettingsFromEnv();
+
+const getSearchProvider = (): string => configuredSearchProvider || DEFAULT_PROVIDER;
+const getSearchModel = (): string => configuredSearchModel || DEFAULT_MODEL;
+const getSearchModelLabel = (): string => `${getSearchProvider()}/${getSearchModel()}`;
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
 const DEFAULT_MODEL_COST_PER_MILLION = {
   input: 0.6,
   output: 2.2,
@@ -228,13 +261,12 @@ const DEFAULT_MODEL_COST_PER_MILLION = {
 };
 const CHUNKS_JSON = 'chunks.json';
 const CHUNKS_JSONL = 'chunks.jsonl';
-const execAsync = promisify(exec);
 const DEFAULT_TOP_K = 20;
 const MIN_SIMILARITY = 0.3;
 const MAX_PREVIEW_SNIPPET_CHARS = 280;
 const MAX_PREVIEW_TOTAL_CHARS = 5000;
 const DEFAULT_MODE = "code";
-const SEARCH_AGENT_IDENTITY_FILE = path.join(os.homedir(), ".pi", "agent", "extensions", "semantic-search", "SEARCH_AGENT.md");
+const SEARCH_AGENT_IDENTITY_FILE = path.join(__extensionDir, "SEARCH_AGENT.md");
 const SUBAGENT_LOG_DIR = path.join(os.homedir(), ".pi", "agent", "cache", "semantic-search", "subagent-logs");
 const IS_SUBAGENT = process.env.PI_SEMANTIC_SUBAGENT === "1";
 const ENABLE_LEGACY_TOOLS = process.env.PI_SEMANTIC_LEGACY === "1" && !IS_SUBAGENT;
@@ -393,7 +425,10 @@ function formatUsageCostLine(usage?: UsageTotals): string {
     usage.input || usage.output || usage.cacheRead || usage.cacheWrite || usage.totalCost
   );
   if (!hasUsage) return "";
-  return `GLM-4.7 cost: $${usage.totalCost.toFixed(4)}`;
+  const label = getSearchModelLabel();
+  const recommended = `${DEFAULT_PROVIDER}/${DEFAULT_MODEL}`;
+  const suffix = label === recommended ? "" : " (est.)";
+  return `${label} cost${suffix}: $${usage.totalCost.toFixed(4)}`;
 }
 
 // Run pi using @file to avoid argv limits (pi handles auth)
@@ -416,10 +451,13 @@ async function callLLM(prompt: string, cwd: string, signal?: AbortSignal): Promi
       fn();
     };
 
+    const provider = getSearchProvider();
+    const model = getSearchModel();
+
     const proc = spawn('pi', [
       '--print',
-      '--provider', DEFAULT_PROVIDER,
-      '--model', DEFAULT_MODEL,
+      '--provider', provider,
+      '--model', model,
       '--thinking', 'off',
       '--no-session',
       `@${promptFile}`
@@ -489,7 +527,7 @@ async function callSearchAgent(
 
   const appendPrompt = fs.existsSync(SEARCH_AGENT_IDENTITY_FILE)
     ? SEARCH_AGENT_IDENTITY_FILE
-    : "You are a read-only search subagent. Use local_embedding_search. Use local_rg only when explicitly requested for exact matches. Do not write files.";
+    : "You are a read-only search subagent. Use local_embedding_search when needed. Do not write files.";
 
   const logFile = options?.logFile;
   const captureUsage = options?.captureUsage ?? false;
@@ -499,6 +537,9 @@ async function callSearchAgent(
   let parseBuffer = "";
   let finalAssistantText = "";
   const usageTotals = captureUsage ? createUsageTotals() : undefined;
+
+  const provider = getSearchProvider();
+  const model = getSearchModel();
 
   const logStream = logFile ? fs.createWriteStream(logFile, { encoding: "utf-8" }) : null;
 
@@ -570,8 +611,8 @@ async function callSearchAgent(
     const args = [
       "--print",
       ...(jsonMode ? ["--mode", "json"] : []),
-      "--provider", DEFAULT_PROVIDER,
-      "--model", DEFAULT_MODEL,
+      "--provider", provider,
+      "--model", model,
       "--thinking", "off",
       "--no-session",
       "--append-system-prompt", appendPrompt,
@@ -775,59 +816,244 @@ export default function (pi: ExtensionAPI) {
   let searchHistory: string[] = [];
   const filterCache = new Map<string, string>();
 
-  // Initialize OpenAI client
-  function initializeOpenAI(ctx: ExtensionContext): boolean {
-    if (openai) return true;
-    
-    // Use extension-isolated API key from .env file
-    const apiKey = extensionEnv.OPENAI_API_KEY;
-    if (!apiKey) {
-      ctx.ui.notify("OpenAI API key not found. Set OPENAI_API_KEY in extensions/semantic-search/.env", "error");
+  const updateExtensionEnv = (ctx: ExtensionContext, updates: Record<string, string>): boolean => {
+    const updatedEnv = { ...extensionEnv, ...updates };
+
+    try {
+      writeExtensionEnv(updatedEnv);
+      extensionEnv = updatedEnv;
+      syncSearchSettingsFromEnv();
+      return true;
+    } catch (error) {
+      ctx.ui.notify(
+        `Failed to write ${ENV_PATH}. ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
       return false;
     }
-    
-    openai = new OpenAI({ apiKey });
+  };
+
+  async function promptForOpenAIKey(ctx: ExtensionContext): Promise<string | null> {
+    const selection = await ctx.ui.select(
+      "OpenAI API key is required to use semantic search.",
+      [
+        {
+          value: "enter",
+          label: "Enter API key",
+          description: `Save to ${ENV_PATH}`
+        },
+        {
+          value: "cancel",
+          label: "Cancel",
+          description: "Configure later"
+        }
+      ]
+    );
+
+    if (selection !== "enter") {
+      return null;
+    }
+
+    const apiKeyInput = await ctx.ui.input(`Paste your ${ENV_OPENAI_KEY} (starts with sk-):`);
+    const apiKey = apiKeyInput?.trim();
+
+    if (!apiKey) {
+      ctx.ui.notify("No API key entered.", "error");
+      return null;
+    }
+
+    if (!updateExtensionEnv(ctx, { [ENV_OPENAI_KEY]: apiKey })) {
+      return null;
+    }
+
+    ctx.ui.notify(`Saved ${ENV_OPENAI_KEY} to ${ENV_PATH}`, "success");
+    return apiKey;
+  }
+
+  async function promptForSearchModel(
+    ctx: ExtensionContext
+  ): Promise<{ provider: string; model: string } | null> {
+    const selection = await ctx.ui.select(
+      "Select the model used for filtering and search summaries.",
+      [
+        {
+          value: "recommended",
+          label: "cerebras / glm-4.7 (best)",
+          description: "Best overall balance of speed + quality"
+        },
+        {
+          value: "openai-mini",
+          label: "openai / gpt-4o-mini",
+          description: "Good quality, slower"
+        },
+        {
+          value: "openai-4o",
+          label: "openai / gpt-4o",
+          description: "Highest quality, slower/expensive"
+        },
+        {
+          value: "custom",
+          label: "Custom provider/model",
+          description: "Enter provider + model manually"
+        },
+        {
+          value: "cancel",
+          label: "Cancel",
+          description: "Configure later"
+        }
+      ]
+    );
+
+    if (!selection || selection === "cancel") {
+      return null;
+    }
+
+    if (selection === "recommended") {
+      return { provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL };
+    }
+
+    if (selection === "openai-mini") {
+      return { provider: "openai", model: "gpt-4o-mini" };
+    }
+
+    if (selection === "openai-4o") {
+      return { provider: "openai", model: "gpt-4o" };
+    }
+
+    const providerInput = await ctx.ui.input("Provider (e.g. cerebras, openai):");
+    const provider = providerInput?.trim();
+    if (!provider) {
+      ctx.ui.notify("Provider is required.", "error");
+      return null;
+    }
+
+    const modelInput = await ctx.ui.input("Model name (e.g. glm-4.7):");
+    const model = modelInput?.trim();
+    if (!model) {
+      ctx.ui.notify("Model name is required.", "error");
+      return null;
+    }
+
+    return { provider, model };
+  }
+
+  async function ensureSearchModel(ctx: ExtensionContext): Promise<boolean> {
+    if (configuredSearchProvider && configuredSearchModel) {
+      return true;
+    }
+
+    if (IS_SUBAGENT) {
+      return true;
+    }
+
+    const selection = await promptForSearchModel(ctx);
+    if (!selection) {
+      ctx.ui.notify("Search model not configured.", "error");
+      return false;
+    }
+
+    if (!updateExtensionEnv(ctx, {
+      [ENV_SEARCH_PROVIDER]: selection.provider,
+      [ENV_SEARCH_MODEL]: selection.model
+    })) {
+      return false;
+    }
+
+    ctx.ui.notify(`Saved search model to ${ENV_PATH}`, "success");
+    return true;
+  }
+
+  // Initialize OpenAI client
+  async function initializeOpenAI(ctx: ExtensionContext): Promise<boolean> {
+    let apiKey = extensionEnv[ENV_OPENAI_KEY]?.trim() || process.env.OPENAI_API_KEY?.trim();
+
+    if (!apiKey && !IS_SUBAGENT) {
+      apiKey = (await promptForOpenAIKey(ctx)) ?? undefined;
+    }
+
+    if (!apiKey) {
+      ctx.ui.notify(`OpenAI API key not found. Set ${ENV_OPENAI_KEY} in ${ENV_PATH}.`, "error");
+      return false;
+    }
+
+    if (!openai) {
+      openai = new OpenAI({ apiKey });
+    }
+
+    if (!await ensureSearchModel(ctx)) {
+      return false;
+    }
+
     return true;
   }
 
   // File discovery and chunking
-  async function discoverFiles(cwd: string, patterns: string[] = DEFAULT_PATTERNS): Promise<string[]> {
-    const files: string[] = [];
-    for (const pattern of patterns) {
-      try {
-        // Extract extension from glob pattern (e.g., "**/*.ts" -> "*.ts")
-        const extension = pattern.replace('**/', '');
-        // Exclude common non-source directories
-        const excludes = [
-          'node_modules', '.git', 'dist', 'build', 'out', 'target',  // Build outputs
-          '.venv', 'venv', '__pycache__', '.pytest_cache',           // Python
-          'vendor', '.bundle',                                        // Ruby/Go
-          '.next', '.nuxt', '.svelte-kit',                           // JS frameworks
-          'coverage', '.nyc_output',                                  // Test coverage
-          '.cache', '.parcel-cache', '.turbo',                       // Caches
-        ].map(d => `-not -path "*/${d}/*"`).join(' ');
-        
-        const { stdout } = await execAsync(
-          `find . -name "${extension}" -type f ${excludes}`, 
-          { cwd, maxBuffer: 10 * 1024 * 1024 }
-        );
-        const found = stdout.trim().split('\n').filter(f => f);
-        files.push(...found.map(f => path.resolve(cwd, f)));
-      } catch {
-        // Skip if pattern doesn't match anything
+  async function discoverFiles(
+    cwd: string,
+    patterns: string[] = DEFAULT_PATTERNS,
+    onUpdate?: (message: string) => void
+  ): Promise<string[]> {
+    const files = new Set<string>();
+    const excludes = [
+      'node_modules', '.git', 'dist', 'build', 'out', 'target',  // Build outputs
+      '.venv', 'venv', '__pycache__', '.pytest_cache',           // Python
+      'vendor', '.bundle',                                        // Ruby/Go
+      '.next', '.nuxt', '.svelte-kit',                           // JS frameworks
+      'coverage', '.nyc_output',                                  // Test coverage
+      '.cache', '.parcel-cache', '.turbo',                       // Caches
+    ];
+    const excludeArgs = excludes.flatMap((dir) => ["-not", "-path", `*/${dir}/*`]);
+
+    const reportProgress = () => {
+      if (files.size > 0 && files.size % DISCOVERY_PROGRESS_EVERY === 0) {
+        onUpdate?.(`Discovering files... ${files.size} found`);
       }
+    };
+
+    for (const pattern of patterns) {
+      // Extract extension from glob pattern (e.g., "**/*.ts" -> "*.ts")
+      const extension = pattern.replace('**/', '');
+
+      await new Promise<void>((resolve) => {
+        const proc = spawn("find", [".", "-name", extension, "-type", "f", ...excludeArgs], {
+          cwd,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+
+        const rl = readline.createInterface({ input: proc.stdout, crlfDelay: Infinity });
+
+        rl.on("line", (line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          files.add(path.resolve(cwd, trimmed));
+          reportProgress();
+        });
+
+        proc.on("error", () => {
+          rl.close();
+          resolve();
+        });
+
+        proc.on("close", () => {
+          rl.close();
+          resolve();
+        });
+      });
+
+      await yieldToEventLoop();
     }
-    
-    // Remove duplicates and sort
-    return [...new Set(files)].sort();
+
+    return [...files].sort();
   }
 
   async function chunkFiles(files: string[]): Promise<FileChunk[]> {
     const chunks: FileChunk[] = [];
     
-    for (const filePath of files) {
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+      const filePath = files[fileIndex];
       try {
-        const content = fs.readFileSync(filePath, 'utf-8');
+        const content = await fs.promises.readFile(filePath, 'utf-8');
         if (content.length < 50) continue; // Skip very small files
         
         const lines = content.split('\n');
@@ -870,8 +1096,12 @@ export default function (pi: ExtensionAPI) {
             contentHash: getContentHash(content),
           });
         }
-      } catch (error) {
+      } catch {
         // Skip files that can't be read
+      }
+
+      if (fileIndex > 0 && fileIndex % CHUNK_YIELD_EVERY === 0) {
+        await yieldToEventLoop();
       }
     }
     
@@ -1317,7 +1547,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     onUpdate?.("Discovering files...");
-    const files = await discoverFiles(cwd, patterns);
+    await yieldToEventLoop();
+    const files = await discoverFiles(cwd, patterns, onUpdate);
     if (files.length === 0) {
       throw new Error("No files found matching patterns.");
     }
@@ -1412,163 +1643,10 @@ Task:
 - Answer the query if possible.
 - Otherwise list the most relevant files and why.
 - Use local_embedding_search to expand the semantic list when needed.
-- Use local_rg only when explicitly asked for exact identifiers, SQL, or API calls.
 - Do not write or modify files.
 
 Return a short answer and a file list.`;
   }
-
-  pi.registerTool({
-    name: "local_rg",
-    label: "Local rg",
-    description: `Run ripgrep locally to find text in the current workspace. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); full output is saved to a temp file when truncated. Use only when explicitly requested; normal agents should run rg directly.`,
-    parameters: Type.Object({
-      pattern: Type.String({ description: "rg pattern (regex)" }),
-      path: Type.Optional(Type.String({ description: "File or directory to search (default: .)" })),
-      maxMatches: Type.Optional(Type.Number({
-        description: "Maximum matches per file",
-        default: 20
-      })),
-      contextLines: Type.Optional(Type.Number({
-        description: "Context lines before/after",
-        default: 2
-      }))
-    }),
-
-    async execute(toolCallId, params, onUpdate, ctx, signal) {
-      const searchPath = params.path?.trim() ? params.path.trim() : ".";
-      const maxMatches = Math.max(1, Math.floor(params.maxMatches ?? 20));
-      const contextLines = Math.max(0, Math.floor(params.contextLines ?? 2));
-
-      const args = [
-        "--line-number",
-        "--context",
-        String(contextLines),
-        "--max-count",
-        String(maxMatches),
-        params.pattern,
-        searchPath
-      ];
-
-      const baseDetails: LocalRgDetails = {
-        pattern: params.pattern,
-        path: params.path?.trim() || undefined
-      };
-
-      const buildResult = (rawOutput: string, isError: boolean) => {
-        const truncation = truncateHead(rawOutput, {
-          maxLines: DEFAULT_MAX_LINES,
-          maxBytes: DEFAULT_MAX_BYTES
-        });
-
-        let resultText = truncation.content;
-        if (truncation.firstLineExceedsLimit) {
-          resultText = `[First line exceeds ${formatSize(truncation.maxBytes)} limit]`;
-        }
-
-        const details: LocalRgDetails = { ...baseDetails };
-
-        if (truncation.truncated) {
-          const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rg-"));
-          const tempFile = path.join(tempDir, "output.txt");
-          fs.writeFileSync(tempFile, rawOutput);
-
-          details.truncation = truncation;
-          details.fullOutputPath = tempFile;
-
-          const truncatedLines = truncation.totalLines - truncation.outputLines;
-          const truncatedBytes = truncation.totalBytes - truncation.outputBytes;
-
-          resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
-          resultText += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
-          resultText += ` ${truncatedLines} lines (${formatSize(truncatedBytes)}) omitted.`;
-          resultText += ` Full output saved to: ${tempFile}]`;
-        }
-
-        const response: {
-          content: { type: "text"; text: string }[];
-          details: LocalRgDetails;
-          isError?: boolean;
-        } = {
-          content: [{ type: "text", text: resultText.trimEnd() }],
-          details
-        };
-
-        if (isError) {
-          response.isError = true;
-        }
-
-        return response;
-      };
-
-      return await new Promise((resolve) => {
-        const proc = spawn("rg", args, {
-          cwd: ctx.cwd,
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"]
-        });
-
-        let stdout = "";
-        let stderr = "";
-
-        proc.stdout.on("data", (data) => {
-          stdout += data.toString();
-        });
-
-        proc.stderr.on("data", (data) => {
-          stderr += data.toString();
-        });
-
-        const finalize = (code: number | null) => {
-          if (code === 0) {
-            if (!stdout.trim()) {
-              resolve({
-                content: [{ type: "text", text: "No matches." }],
-                details: baseDetails
-              });
-              return;
-            }
-            resolve(buildResult(stdout, false));
-            return;
-          }
-          if (code === 1) {
-            resolve({
-              content: [{ type: "text", text: "No matches." }],
-              details: baseDetails
-            });
-            return;
-          }
-          const errorOutput = stderr.trim() || "rg failed.";
-          resolve(buildResult(errorOutput, true));
-        };
-
-        proc.on("close", (code) => finalize(code));
-
-        proc.on("error", (error) => {
-          resolve(buildResult(String(error), true));
-        });
-
-        if (signal) {
-          const killProc = () => {
-            proc.kill("SIGTERM");
-            setTimeout(() => {
-              if (!proc.killed) proc.kill("SIGKILL");
-            }, 5000);
-          };
-
-          if (signal.aborted) {
-            killProc();
-            resolve(buildResult("Aborted.", true));
-          } else {
-            signal.addEventListener("abort", () => {
-              killProc();
-              resolve(buildResult("Aborted.", true));
-            }, { once: true });
-          }
-        }
-      });
-    },
-  });
 
   pi.registerTool({
     name: "local_embedding_search",
@@ -1588,7 +1666,7 @@ Return a short answer and a file list.`;
     }),
 
     async execute(toolCallId, params, onUpdate, ctx, signal) {
-      if (!initializeOpenAI(ctx)) {
+      if (!await initializeOpenAI(ctx)) {
         return {
           content: [{
             type: "text",
@@ -1681,8 +1759,8 @@ ${preview}`;
 
   if (!IS_SUBAGENT) {
     pi.registerTool({
-      name: "local_semantic_search",
-      label: "Local Semantic Search",
+      name: "search_agent",
+      label: "Search Agent",
       description: "Search locally and use a search subagent to refine results, with optional query extrapolation.",
       parameters: Type.Object({
         query: Type.String({ description: "Main search query in natural language" }),
@@ -1706,7 +1784,7 @@ ${preview}`;
       }),
 
       async execute(toolCallId, params, onUpdate, ctx, signal) {
-        if (!initializeOpenAI(ctx)) {
+        if (!await initializeOpenAI(ctx)) {
           return {
             content: [{
               type: "text",
@@ -1880,7 +1958,7 @@ ${filesList}`;
     }),
 
     async execute(toolCallId, params, onUpdate, ctx, signal) {
-      if (!initializeOpenAI(ctx)) {
+      if (!await initializeOpenAI(ctx)) {
         return {
           content: [{ 
             type: "text", 
@@ -1905,9 +1983,12 @@ ${filesList}`;
       }
 
       onUpdate?.({ content: [{ type: "text", text: "🔍 Discovering files..." }] });
-      
+      await yieldToEventLoop();
+
       // Discover files
-      const files = await discoverFiles(cwd, params.patterns);
+      const files = await discoverFiles(cwd, params.patterns, (message) => {
+        onUpdate?.({ content: [{ type: "text", text: `🔍 ${message}` }] });
+      });
       if (files.length === 0) {
         return {
           content: [{ 
@@ -2009,7 +2090,7 @@ ${filesList}`;
     if (!existingMeta) {
       // No existing index, create new one
       onUpdate?.("No existing index found, creating new index...");
-      const files = await discoverFiles(cwd, patterns);
+      const files = await discoverFiles(cwd, patterns, onUpdate);
       const chunks = await chunkFiles(files);
       const chunksWithEmbeddings = await generateEmbeddings(chunks);
       
@@ -2029,7 +2110,7 @@ ${filesList}`;
 
     // Check for new/modified/deleted files
     onUpdate?.("Checking for file changes...");
-    const currentFiles = await discoverFiles(cwd, patterns);
+    const currentFiles = await discoverFiles(cwd, patterns, onUpdate);
     const currentFilesSet = new Set(currentFiles);
     
     // Get old files from metadata's fileIndexTimes (don't load all chunks)
@@ -2125,7 +2206,7 @@ ${filesList}`;
     }),
 
     async execute(toolCallId, params, onUpdate, ctx, signal) {
-      if (!initializeOpenAI(ctx)) {
+      if (!await initializeOpenAI(ctx)) {
         return {
           content: [{ 
             type: "text", 
@@ -2156,8 +2237,11 @@ ${filesList}`;
             text: `🔨 Force rebuilding index...` 
           }] 
         });
-        
-        const files = await discoverFiles(cwd);
+        await yieldToEventLoop();
+
+        const files = await discoverFiles(cwd, DEFAULT_PATTERNS, (message) => {
+          onUpdate?.({ content: [{ type: "text", text: `🔍 ${message}` }] });
+        });
         const chunks = await chunkFiles(files);
         
         onUpdate?.({ 
@@ -2233,8 +2317,8 @@ ${filesList}`;
       if (searchHistory.length > 10) searchHistory.pop();
 
       // Step 2: Parallel GLM relevance filtering
-      const filterModel = DEFAULT_MODEL;
-      const summaryModel = DEFAULT_MODEL;
+      const filterModel = getSearchModelLabel();
+      const summaryModel = getSearchModelLabel();
       const maxParallelFilters = params.maxParallelFilters ?? 4;
       
       // Group chunks by file for filtering
@@ -2503,7 +2587,7 @@ Be concise but comprehensive. Use markdown formatting.`;
   pi.registerCommand("semantic", {
     description: "Interactive semantic search interface",
     handler: async (_args, ctx) => {
-      if (!initializeOpenAI(ctx)) {
+      if (!await initializeOpenAI(ctx)) {
         ctx.ui.notify("OpenAI API key not found", "error");
         return;
       }
@@ -2767,7 +2851,7 @@ Return only the processed analysis, no explanations about your process.`;
   }
 
   if (IS_SUBAGENT) {
-    pi.setActiveTools(["read", "local_embedding_search", "local_rg"]);
+    pi.setActiveTools(["read", "local_embedding_search"]);
   }
 
   }
