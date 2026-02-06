@@ -8,7 +8,8 @@
 
 On first run you will be prompted (via UI) to:
 1. Enter your `OPENAI_API_KEY` (used for embeddings).
-2. Choose a search model (recommended: **cerebras / glm-4.7**).
+2. Choose a search model (recommended: **cerebras / zai-glm-4.7**).
+   - Alternatively, **anthropic / claude-haiku-4-5** is a good default if you want reasoning.
 
 Configuration is stored in:
 ```
@@ -18,7 +19,8 @@ Configuration is stored in:
 You can edit the file manually later. Supported keys:
 - `OPENAI_API_KEY`
 - `SEARCH_PROVIDER` (e.g. `cerebras`, `openai`)
-- `SEARCH_MODEL` (e.g. `glm-4.7`, `gpt-4o-mini`)
+- `SEARCH_MODEL` (e.g. `zai-glm-4.7`, `gpt-4o-mini`)
+- `SEARCH_THINKING` (optional: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`)
 
 ## Tools
 
@@ -45,6 +47,29 @@ Example:
 local_embedding_search(query: "retry logic", path: "packages/api")
 ```
 
+## Commands
+
+### `/search-agent-settings`
+Open an interactive UI to configure or change:
+- `OPENAI_API_KEY`
+- `SEARCH_PROVIDER` + `SEARCH_MODEL`
+- `SEARCH_THINKING`
+
+Settings are saved to:
+```
+~/.pi/extensions/pi-search-agent/.env
+```
+
+### `/search-agent <query> [--path <filter>] [--cwd <dir>] [--mode <mode>] [--log]`
+Run the semantic search pipeline directly from a user command (no need to ask the model to call the tool).
+
+Examples:
+```
+/search-agent How do we authenticate API requests?
+/search-agent "retry logic" --path packages/api
+/search-agent "where is initializeOpenAI" --cwd ~/src/ai-extensions/semantic-search --log
+```
+
 ## How it works
 
 1. **File discovery**: streams `find` results and yields to the event loop to avoid blocking the UI.
@@ -54,7 +79,7 @@ local_embedding_search(query: "retry logic", path: "packages/api")
 5. **Search pipeline**:
    - embedding matches → merged per file
    - subagent refines results and provides a concise answer
-6. **Summaries / filtering**: uses the configured `SEARCH_PROVIDER` + `SEARCH_MODEL`.
+6. **Summaries / filtering**: uses the configured `SEARCH_PROVIDER` + `SEARCH_MODEL` (and optional `SEARCH_THINKING`).
 
 ## Data locations
 
@@ -76,4 +101,5 @@ This re-enables:
 
 - `mode` is accepted but currently ignored; `code` includes markdown.
 - Indexing is per-cwd. If no index exists, it is created automatically.
-- The recommended search model is **cerebras / glm-4.7**.
+- The recommended search model is **cerebras / zai-glm-4.7**.
+- `SEARCH_THINKING` is clamped to `off` for non-reasoning models (so it has no effect for cerebras/zai-glm-4.7).

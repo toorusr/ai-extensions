@@ -21,12 +21,14 @@ import { fileURLToPath } from "node:url";
 import * as dotenv from "dotenv";
 
 // Load extension-specific .env file into isolated config (doesn't touch process.env)
-const __extensionDir = path.dirname(fileURLToPath(import.meta.url));
+const __extensionPath = fileURLToPath(import.meta.url);
+const __extensionDir = path.dirname(__extensionPath);
 const ENV_DIR = path.join(os.homedir(), ".pi", "extensions", "pi-search-agent");
 const ENV_PATH = path.join(ENV_DIR, ".env");
 const ENV_OPENAI_KEY = "OPENAI_API_KEY";
 const ENV_SEARCH_PROVIDER = "SEARCH_PROVIDER";
 const ENV_SEARCH_MODEL = "SEARCH_MODEL";
+const ENV_SEARCH_THINKING = "SEARCH_THINKING";
 
 const loadExtensionEnv = (): Record<string, string> => {
   if (fs.existsSync(ENV_PATH)) {
@@ -40,8 +42,9 @@ const writeExtensionEnv = (env: Record<string, string>): void => {
     ENV_OPENAI_KEY,
     ENV_SEARCH_PROVIDER,
     ENV_SEARCH_MODEL,
+    ENV_SEARCH_THINKING,
     ...Object.keys(env)
-      .filter((key) => ![ENV_OPENAI_KEY, ENV_SEARCH_PROVIDER, ENV_SEARCH_MODEL].includes(key))
+      .filter((key) => ![ENV_OPENAI_KEY, ENV_SEARCH_PROVIDER, ENV_SEARCH_MODEL, ENV_SEARCH_THINKING].includes(key))
       .sort()
   ];
 
@@ -58,7 +61,14 @@ const writeExtensionEnv = (env: Record<string, string>): void => {
 
 let extensionEnv = loadExtensionEnv();
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+  ModelSelectorComponent,
+  SettingsManager,
+  ThinkingSelectorComponent,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type ExtensionCommandContext
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   Container,
@@ -234,22 +244,50 @@ const MAX_FILTER_TOTAL_CHARS = 800; // Cap total prompt content per file
 const MAX_SUMMARY_FILES = 6; // Cap files sent to summary model
 const MAX_SUMMARY_CHARS_PER_FILE = 1200; // Cap summary context per file
 const DEFAULT_PROVIDER = 'cerebras'; // Provider for parallel filtering
-const DEFAULT_MODEL = 'glm-4.7'; // Fast GLM model via cerebras
+const DEFAULT_MODEL = 'zai-glm-4.7'; // Fast GLM model via cerebras
 const DISCOVERY_PROGRESS_EVERY = 200;
-const CHUNK_YIELD_EVERY = 25;
+const CHUNK_YIELD_EVERY = 1;
+const CHUNK_LINE_YIELD_EVERY = 1000;
+const CHUNK_PROGRESS_BUCKETS = 10;
 
 let configuredSearchProvider = extensionEnv[ENV_SEARCH_PROVIDER]?.trim() || "";
 let configuredSearchModel = extensionEnv[ENV_SEARCH_MODEL]?.trim() || "";
+let configuredSearchThinking = extensionEnv[ENV_SEARCH_THINKING]?.trim() || "";
+
+function normalizeSearchModel(provider: string, model: string): { provider: string; model: string } {
+  const normalizedProvider = provider.trim();
+  let normalizedModel = model.trim();
+
+  // Backwards compat: older configs used "glm-4.7" (pi renamed it to "zai-glm-4.7").
+  if (normalizedProvider === "cerebras" && normalizedModel === "glm-4.7") {
+    normalizedModel = "zai-glm-4.7";
+  }
+
+  return { provider: normalizedProvider, model: normalizedModel };
+}
+
+const SEARCH_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+function normalizeSearchThinking(thinking: string): string {
+  const normalized = thinking.trim().toLowerCase();
+  if (!normalized) return "";
+  return SEARCH_THINKING_LEVELS.has(normalized) ? normalized : "";
+}
 
 const syncSearchSettingsFromEnv = (): void => {
-  configuredSearchProvider = extensionEnv[ENV_SEARCH_PROVIDER]?.trim() || "";
-  configuredSearchModel = extensionEnv[ENV_SEARCH_MODEL]?.trim() || "";
+  const rawProvider = extensionEnv[ENV_SEARCH_PROVIDER]?.trim() || "";
+  const rawModel = extensionEnv[ENV_SEARCH_MODEL]?.trim() || "";
+  const normalized = normalizeSearchModel(rawProvider, rawModel);
+  configuredSearchProvider = normalized.provider;
+  configuredSearchModel = normalized.model;
+  configuredSearchThinking = normalizeSearchThinking(extensionEnv[ENV_SEARCH_THINKING]?.trim() || "");
 };
 
 syncSearchSettingsFromEnv();
 
 const getSearchProvider = (): string => configuredSearchProvider || DEFAULT_PROVIDER;
 const getSearchModel = (): string => configuredSearchModel || DEFAULT_MODEL;
+const getSearchThinkingLevel = (): string => configuredSearchThinking || "off";
 const getSearchModelLabel = (): string => `${getSearchProvider()}/${getSearchModel()}`;
 const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
@@ -458,8 +496,9 @@ async function callLLM(prompt: string, cwd: string, signal?: AbortSignal): Promi
       '--print',
       '--provider', provider,
       '--model', model,
-      '--thinking', 'off',
+      '--thinking', getSearchThinkingLevel(),
       '--no-session',
+      '--no-extensions',
       `@${promptFile}`
     ], {
       cwd,
@@ -613,8 +652,10 @@ async function callSearchAgent(
       ...(jsonMode ? ["--mode", "json"] : []),
       "--provider", provider,
       "--model", model,
-      "--thinking", "off",
+      "--thinking", getSearchThinkingLevel(),
       "--no-session",
+      "--no-extensions",
+      "--extension", __extensionPath,
       "--append-system-prompt", appendPrompt,
       "--tools", "read",
       `@${promptFile}`
@@ -813,8 +854,50 @@ function cleanOldCacheEntriesOnDisk(): void {
 export default function (pi: ExtensionAPI) {
   // State - minimal memory footprint
   let openai: OpenAI | null = null;
+  let openaiApiKey: string | null = null;
   let searchHistory: string[] = [];
   const filterCache = new Map<string, string>();
+  let lastOpenAIInitError: string | null = null;
+
+  const getOpenAIInitError = (): string =>
+    lastOpenAIInitError ?? "Failed to initialize OpenAI client.";
+
+  const getMissingOpenAIKeyMessage = (): string =>
+    `OpenAI API key is required to use semantic search.\n\nSet ${ENV_OPENAI_KEY} in ${ENV_PATH} (recommended) or export OPENAI_API_KEY.\nYou can also run /search-agent-settings.`;
+
+  const getMissingSearchModelMessage = (): string =>
+    `Search model is not configured.\n\nSet ${ENV_SEARCH_PROVIDER} and ${ENV_SEARCH_MODEL} in ${ENV_PATH}.\nYou can also run /search-agent-settings.`;
+
+  const reloadExtensionEnvFromDisk = (): void => {
+    extensionEnv = loadExtensionEnv();
+    syncSearchSettingsFromEnv();
+  };
+
+  // In subagent mode we want a read-only tool set (no bash/edit/write).
+  // This must run after the extension runtime is initialized (session_start),
+  // not during extension loading.
+  pi.on("session_start", async (_event, ctx) => {
+    reloadExtensionEnvFromDisk();
+
+    if (IS_SUBAGENT) {
+      pi.setActiveTools(["read", "local_embedding_search"]);
+      return;
+    }
+
+    if (!ctx.hasUI) return;
+
+    const hasKey = Boolean(extensionEnv[ENV_OPENAI_KEY]?.trim() || process.env.OPENAI_API_KEY?.trim());
+    const hasModel = Boolean(configuredSearchProvider && configuredSearchModel);
+
+    if (!hasKey || !hasModel) {
+      ctx.ui.setStatus(
+        "search-agent",
+        `Search agent not configured. Edit ${ENV_PATH} or run /search-agent-settings.`
+      );
+    } else {
+      ctx.ui.setStatus("search-agent", undefined);
+    }
+  });
 
   const updateExtensionEnv = (ctx: ExtensionContext, updates: Record<string, string>): boolean => {
     const updatedEnv = { ...extensionEnv, ...updates };
@@ -823,6 +906,12 @@ export default function (pi: ExtensionAPI) {
       writeExtensionEnv(updatedEnv);
       extensionEnv = updatedEnv;
       syncSearchSettingsFromEnv();
+
+      if (Object.prototype.hasOwnProperty.call(updates, ENV_OPENAI_KEY)) {
+        openai = null;
+        openaiApiKey = null;
+      }
+
       return true;
     } catch (error) {
       ctx.ui.notify(
@@ -834,23 +923,17 @@ export default function (pi: ExtensionAPI) {
   };
 
   async function promptForOpenAIKey(ctx: ExtensionContext): Promise<string | null> {
+    const options = [
+      `Enter API key (save to ${ENV_PATH})`,
+      "Cancel"
+    ];
+
     const selection = await ctx.ui.select(
-      "OpenAI API key is required to use semantic search.",
-      [
-        {
-          value: "enter",
-          label: "Enter API key",
-          description: `Save to ${ENV_PATH}`
-        },
-        {
-          value: "cancel",
-          label: "Cancel",
-          description: "Configure later"
-        }
-      ]
+      "OpenAI API key is required for embeddings (best quality). Sign up at https://platform.openai.com/signup and create a key at https://platform.openai.com/api-keys.",
+      options
     );
 
-    if (selection !== "enter") {
+    if (!selection || selection === "Cancel") {
       return null;
     }
 
@@ -866,78 +949,118 @@ export default function (pi: ExtensionAPI) {
       return null;
     }
 
-    ctx.ui.notify(`Saved ${ENV_OPENAI_KEY} to ${ENV_PATH}`, "success");
+    ctx.ui.notify(`Saved ${ENV_OPENAI_KEY} to ${ENV_PATH}`, "info");
     return apiKey;
   }
 
   async function promptForSearchModel(
     ctx: ExtensionContext
   ): Promise<{ provider: string; model: string } | null> {
+    const options = [
+      "cerebras / zai-glm-4.7 (best)",
+      "Pick from available models (pi model picker)",
+      "anthropic / claude-haiku-4-5",
+      "Custom provider/model",
+      "Cancel"
+    ];
+
     const selection = await ctx.ui.select(
       "Select the model used for filtering and search summaries.",
-      [
-        {
-          value: "recommended",
-          label: "cerebras / glm-4.7 (best)",
-          description: "Best overall balance of speed + quality"
-        },
-        {
-          value: "openai-mini",
-          label: "openai / gpt-4o-mini",
-          description: "Good quality, slower"
-        },
-        {
-          value: "openai-4o",
-          label: "openai / gpt-4o",
-          description: "Highest quality, slower/expensive"
-        },
-        {
-          value: "custom",
-          label: "Custom provider/model",
-          description: "Enter provider + model manually"
-        },
-        {
-          value: "cancel",
-          label: "Cancel",
-          description: "Configure later"
-        }
-      ]
+      options
     );
 
-    if (!selection || selection === "cancel") {
+    if (!selection || selection === "Cancel") {
       return null;
     }
 
-    if (selection === "recommended") {
+    if (selection === options[0]) {
       return { provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL };
     }
 
-    if (selection === "openai-mini") {
-      return { provider: "openai", model: "gpt-4o-mini" };
+    if (selection === options[1]) {
+      const currentSearchModel = (configuredSearchProvider && configuredSearchModel)
+        ? ctx.modelRegistry.find(configuredSearchProvider, configuredSearchModel)
+        : ctx.model;
+
+      const picked = await ctx.ui.custom<{ provider: string; model: string } | null>(
+        (tui, _theme, _keybindings, done) => {
+          // Use in-memory settings manager so we don't mutate global pi settings.
+          const settingsManager = SettingsManager.inMemory();
+
+          return new ModelSelectorComponent(
+            tui,
+            currentSearchModel,
+            settingsManager,
+            ctx.modelRegistry,
+            [],
+            (model) => done({ provider: String(model.provider), model: model.id }),
+            () => done(null)
+          );
+        },
+        { overlay: true }
+      );
+
+      return picked;
     }
 
-    if (selection === "openai-4o") {
-      return { provider: "openai", model: "gpt-4o" };
+    if (selection === options[2]) {
+      return { provider: "anthropic", model: "claude-haiku-4-5" };
     }
 
-    const providerInput = await ctx.ui.input("Provider (e.g. cerebras, openai):");
-    const provider = providerInput?.trim();
-    if (!provider) {
-      ctx.ui.notify("Provider is required.", "error");
-      return null;
+    if (selection === options[3]) {
+      const providerInput = await ctx.ui.input("Provider (e.g. cerebras, anthropic):");
+      const provider = providerInput?.trim();
+      if (!provider) {
+        ctx.ui.notify("Provider is required.", "error");
+        return null;
+      }
+
+      const modelInput = await ctx.ui.input("Model name (e.g. zai-glm-4.7, claude-haiku-4-5):");
+      const model = modelInput?.trim();
+      if (!model) {
+        ctx.ui.notify("Model name is required.", "error");
+        return null;
+      }
+
+      return { provider, model };
     }
 
-    const modelInput = await ctx.ui.input("Model name (e.g. glm-4.7):");
-    const model = modelInput?.trim();
-    if (!model) {
-      ctx.ui.notify("Model name is required.", "error");
-      return null;
-    }
+    return null;
+  }
 
-    return { provider, model };
+  async function promptForSearchThinking(ctx: ExtensionContext): Promise<string | null> {
+    const currentLevel = normalizeSearchThinking(configuredSearchThinking) || "off";
+
+    // Allow configuring any thinking level even if the current search model doesn't support it.
+    // pi will clamp thinking to "off" automatically for non-reasoning models.
+    const availableLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+    const selected = await ctx.ui.custom<string | null>(
+      (_tui, _theme, _keybindings, done) => {
+        // ThinkingSelectorComponent is a Container without handleInput();
+        // wrap it so key events reach the underlying SelectList.
+        class ThinkingSelectorOverlay extends ThinkingSelectorComponent {
+          handleInput(data: string): void {
+            this.getSelectList().handleInput(data);
+          }
+        }
+
+        return new ThinkingSelectorOverlay(
+          currentLevel as any,
+          availableLevels as any,
+          (level) => done(level as any),
+          () => done(null)
+        );
+      },
+      { overlay: true }
+    );
+
+    return selected;
   }
 
   async function ensureSearchModel(ctx: ExtensionContext): Promise<boolean> {
+    reloadExtensionEnvFromDisk();
+
     if (configuredSearchProvider && configuredSearchModel) {
       return true;
     }
@@ -946,9 +1069,16 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
 
+    if (!ctx.hasUI) {
+      lastOpenAIInitError = getMissingSearchModelMessage();
+      return false;
+    }
+
     const selection = await promptForSearchModel(ctx);
     if (!selection) {
-      ctx.ui.notify("Search model not configured.", "error");
+      const message = getMissingSearchModelMessage();
+      lastOpenAIInitError = message;
+      ctx.ui.notify(message, "error");
       return false;
     }
 
@@ -956,36 +1086,378 @@ export default function (pi: ExtensionAPI) {
       [ENV_SEARCH_PROVIDER]: selection.provider,
       [ENV_SEARCH_MODEL]: selection.model
     })) {
+      lastOpenAIInitError = getMissingSearchModelMessage();
       return false;
     }
 
-    ctx.ui.notify(`Saved search model to ${ENV_PATH}`, "success");
+    ctx.ui.notify(`Saved search model to ${ENV_PATH}`, "info");
     return true;
   }
 
   // Initialize OpenAI client
   async function initializeOpenAI(ctx: ExtensionContext): Promise<boolean> {
+    lastOpenAIInitError = null;
+    reloadExtensionEnvFromDisk();
+
     let apiKey = extensionEnv[ENV_OPENAI_KEY]?.trim() || process.env.OPENAI_API_KEY?.trim();
 
-    if (!apiKey && !IS_SUBAGENT) {
+    if (!apiKey && !IS_SUBAGENT && ctx.hasUI) {
       apiKey = (await promptForOpenAIKey(ctx)) ?? undefined;
     }
 
     if (!apiKey) {
-      ctx.ui.notify(`OpenAI API key not found. Set ${ENV_OPENAI_KEY} in ${ENV_PATH}.`, "error");
+      const message = getMissingOpenAIKeyMessage();
+      lastOpenAIInitError = message;
+      if (ctx.hasUI) {
+        ctx.ui.notify(message, "error");
+      }
       return false;
     }
 
-    if (!openai) {
+    if (!openai || openaiApiKey !== apiKey) {
       openai = new OpenAI({ apiKey });
+      openaiApiKey = apiKey;
     }
 
     if (!await ensureSearchModel(ctx)) {
+      lastOpenAIInitError = lastOpenAIInitError ?? getMissingSearchModelMessage();
       return false;
     }
 
     return true;
   }
+
+  const SEARCH_AGENT_COMMAND_MESSAGE_TYPE = "search-agent";
+
+  const extractTextContent = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return String(content ?? "");
+    return (content as any[])
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("");
+  };
+
+  const maskSecret = (value: string): string => {
+    const trimmed = value.trim();
+    if (!trimmed) return "not set";
+    if (trimmed.length <= 10) return `${trimmed.substring(0, 3)}…`;
+    return `${trimmed.substring(0, 6)}…${trimmed.substring(trimmed.length - 4)}`;
+  };
+
+  const getSettingsSummary = (): string => {
+    const storedKey = extensionEnv[ENV_OPENAI_KEY]?.trim() || "";
+    const envKey = process.env.OPENAI_API_KEY?.trim() || "";
+    const keySource = storedKey ? ENV_PATH : (envKey ? "OPENAI_API_KEY env var" : "not set");
+    const effectiveKey = storedKey || envKey;
+    const provider = configuredSearchProvider || "";
+    const model = configuredSearchModel || "";
+    const modelLabel = provider && model ? `${provider}/${model}` : "not set";
+    const thinkingLabel = configuredSearchThinking ? configuredSearchThinking : "off";
+
+    return `Config file: ${ENV_PATH}\nOpenAI key: ${effectiveKey ? maskSecret(effectiveKey) : "not set"} (${keySource})\nSearch model: ${modelLabel}\nSearch thinking: ${thinkingLabel}`;
+  };
+
+  pi.registerMessageRenderer(SEARCH_AGENT_COMMAND_MESSAGE_TYPE, (message, _options, theme) => {
+    const body = extractTextContent(message.content);
+    const header = theme.fg("toolTitle", "🔍 search-agent");
+    return new Text(`${header}\n\n${body}`, 1, 0);
+  });
+
+  pi.registerCommand("search-agent-settings", {
+    description: "Configure OpenAI API key, search model, and thinking level for the search agent",
+    handler: async (_args, ctx: ExtensionCommandContext) => {
+      if (!ctx.hasUI) return;
+
+      while (true) {
+        reloadExtensionEnvFromDisk();
+
+        const storedKey = extensionEnv[ENV_OPENAI_KEY]?.trim() || "";
+        const envKey = process.env.OPENAI_API_KEY?.trim() || "";
+        const effectiveKey = storedKey || envKey;
+        const keyDisplay = effectiveKey ? maskSecret(effectiveKey) : "not set";
+        const modelDisplay = configuredSearchProvider && configuredSearchModel
+          ? `${configuredSearchProvider}/${configuredSearchModel}`
+          : "not set";
+        const thinkingDisplay = configuredSearchThinking ? configuredSearchThinking : "off";
+
+        const options = [
+          `Set/OpenAI API key (currently: ${keyDisplay})`,
+          `Set search model (currently: ${modelDisplay})`,
+          `Set thinking level (currently: ${thinkingDisplay})`,
+          `Edit ${ENV_PATH}`,
+          "Done"
+        ];
+
+        const selection = await ctx.ui.select(
+          `Search Agent Settings\n\n${getSettingsSummary()}`,
+          options
+        );
+
+        if (!selection || selection === "Done") {
+          return;
+        }
+
+        if (selection === options[0]) {
+          const input = await ctx.ui.input(
+            `Enter ${ENV_OPENAI_KEY} (leave empty to clear).`,
+            "sk-..."
+          );
+          if (input === undefined) continue;
+
+          const next = input.trim();
+          if (!updateExtensionEnv(ctx, { [ENV_OPENAI_KEY]: next })) {
+            continue;
+          }
+
+          ctx.ui.notify(
+            next
+              ? `Saved ${ENV_OPENAI_KEY} to ${ENV_PATH}`
+              : `Cleared ${ENV_OPENAI_KEY} in ${ENV_PATH}`,
+            "info"
+          );
+          continue;
+        }
+
+        if (selection === options[1]) {
+          const modelSelection = await promptForSearchModel(ctx);
+          if (!modelSelection) continue;
+
+          if (!updateExtensionEnv(ctx, {
+            [ENV_SEARCH_PROVIDER]: modelSelection.provider,
+            [ENV_SEARCH_MODEL]: modelSelection.model
+          })) {
+            continue;
+          }
+
+          ctx.ui.notify(`Saved search model to ${ENV_PATH}`, "info");
+          continue;
+        }
+
+        if (selection === options[2]) {
+          let thinkingSelection: string | null = null;
+          try {
+            thinkingSelection = await promptForSearchThinking(ctx);
+          } catch (error) {
+            ctx.ui.notify(
+              `Failed to select thinking level. ${error instanceof Error ? error.message : String(error)}`,
+              "error"
+            );
+            continue;
+          }
+
+          if (!thinkingSelection) continue;
+
+          if (!updateExtensionEnv(ctx, { [ENV_SEARCH_THINKING]: thinkingSelection })) {
+            continue;
+          }
+
+          ctx.ui.notify(`Saved search thinking level to ${ENV_PATH}`, "info");
+          continue;
+        }
+
+        if (selection === options[3]) {
+          const existing = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf-8") : "";
+          const edited = await ctx.ui.editor(`Edit ${ENV_PATH}`, existing);
+          if (edited === undefined) continue;
+
+          try {
+            fs.mkdirSync(ENV_DIR, { recursive: true });
+            fs.writeFileSync(ENV_PATH, edited.trimEnd() + "\n", "utf-8");
+            reloadExtensionEnvFromDisk();
+            ctx.ui.notify(`Saved ${ENV_PATH}`, "info");
+          } catch (error) {
+            ctx.ui.notify(
+              `Failed to write ${ENV_PATH}. ${error instanceof Error ? error.message : String(error)}`,
+              "error"
+            );
+          }
+          continue;
+        }
+      }
+    },
+  });
+
+  function tokenizeCommandArgs(input: string): string[] {
+    return input.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  }
+
+  function stripQuotes(value: string): string {
+    const trimmed = value.trim();
+    if (
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'"))
+    ) {
+      return trimmed.slice(1, -1);
+    }
+    return trimmed;
+  }
+
+  function parseSearchAgentCommandArgs(input: string): {
+    query: string;
+    cwd?: string;
+    path?: string;
+    mode?: string;
+    logSubagent: boolean;
+  } {
+    const tokens = tokenizeCommandArgs(input);
+    const queryParts: string[] = [];
+    let cwd: string | undefined;
+    let pathFilter: string | undefined;
+    let mode: string | undefined;
+    let logSubagent = false;
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+
+      if (token === "--log") {
+        logSubagent = true;
+        continue;
+      }
+
+      if (token === "--cwd" && i + 1 < tokens.length) {
+        cwd = stripQuotes(tokens[++i]);
+        continue;
+      }
+
+      if (token.startsWith("--cwd=")) {
+        cwd = stripQuotes(token.slice("--cwd=".length));
+        continue;
+      }
+
+      if (token === "--path" && i + 1 < tokens.length) {
+        pathFilter = stripQuotes(tokens[++i]);
+        continue;
+      }
+
+      if (token.startsWith("--path=")) {
+        pathFilter = stripQuotes(token.slice("--path=".length));
+        continue;
+      }
+
+      if (token === "--mode" && i + 1 < tokens.length) {
+        mode = stripQuotes(tokens[++i]);
+        continue;
+      }
+
+      if (token.startsWith("--mode=")) {
+        mode = stripQuotes(token.slice("--mode=".length));
+        continue;
+      }
+
+      queryParts.push(stripQuotes(token));
+    }
+
+    return {
+      query: queryParts.join(" ").trim(),
+      cwd,
+      path: pathFilter,
+      mode,
+      logSubagent
+    };
+  }
+
+  pi.registerCommand("search-agent", {
+    description: "Run semantic search agent (builds/uses local index and summarizes results)",
+    handler: async (args, ctx: ExtensionCommandContext) => {
+      if (!ctx.hasUI) return;
+
+      if (!ctx.isIdle()) {
+        ctx.ui.notify("Wait for the current response to finish before running /search-agent.", "warning");
+        return;
+      }
+
+      const parsed = parseSearchAgentCommandArgs(args ?? "");
+      let query = parsed.query;
+
+      if (!query) {
+        const input = await ctx.ui.input("Search query:");
+        query = input?.trim() || "";
+      }
+
+      if (!query) return;
+
+      const cwd = parsed.cwd
+        ? path.resolve(ctx.cwd, expandTilde(parsed.cwd))
+        : ctx.cwd;
+
+      const mode = normalizeMode(parsed.mode);
+      const patterns = resolvePatternsForMode(mode);
+      const pathFilter = parsed.path?.trim() || undefined;
+      const subagentLogPath = parsed.logSubagent ? createSubagentLogPath() : undefined;
+
+      if (!await initializeOpenAI(ctx)) {
+        const message = getOpenAIInitError();
+        ctx.ui.notify(message, "error");
+        pi.sendMessage(
+          { customType: SEARCH_AGENT_COMMAND_MESSAGE_TYPE, content: message, display: true },
+          { deliverAs: "steer", triggerTurn: false }
+        );
+        return;
+      }
+
+      ctx.ui.setStatus("search-agent", "Ensuring index exists...");
+      try {
+        await ensureIndex(cwd, patterns, (message) => ctx.ui.setStatus("search-agent", message));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.setStatus("search-agent", undefined);
+        ctx.ui.notify(message, "error");
+        pi.sendMessage(
+          { customType: SEARCH_AGENT_COMMAND_MESSAGE_TYPE, content: message, display: true },
+          { deliverAs: "steer", triggerTurn: false }
+        );
+        return;
+      }
+
+      ctx.ui.setStatus("search-agent", "Searching embeddings...");
+      const matches = await embeddingSearchByFile(cwd, query, pathFilter, DEFAULT_TOP_K);
+
+      if (matches.length === 0) {
+        const message = `No embedding matches found for "${query}".`;
+        ctx.ui.setStatus("search-agent", undefined);
+        pi.sendMessage(
+          { customType: SEARCH_AGENT_COMMAND_MESSAGE_TYPE, content: message, display: true },
+          { deliverAs: "steer", triggerTurn: false }
+        );
+        return;
+      }
+
+      const preview = formatMatchList(matches, MAX_PREVIEW_TOTAL_CHARS);
+      const prompt = buildSearchAgentPrompt(query, pathFilter, mode, preview, []);
+
+      ctx.ui.setStatus("search-agent", "Running search agent...");
+      let agentOutput = "";
+      let agentUsage: UsageTotals | undefined;
+      let agentLogPath = subagentLogPath;
+
+      try {
+        const agentResult = await callSearchAgent(prompt, cwd, undefined, {
+          logFile: subagentLogPath,
+          captureUsage: true
+        });
+        agentOutput = agentResult.output;
+        agentUsage = agentResult.usage;
+        agentLogPath = agentResult.logFile;
+      } catch (error) {
+        agentOutput = error instanceof Error ? error.message : String(error);
+      } finally {
+        ctx.ui.setStatus("search-agent", undefined);
+      }
+
+      const filesList = formatMatchFileList(matches);
+      const logLine = agentLogPath ? `\n\nSubagent log:\n${agentLogPath}` : "";
+      const costLine = formatUsageCostLine(agentUsage);
+      const costSection = costLine ? `\n\n${costLine}` : "";
+
+      const resultText = `Query: "${query}"\nPath filter: ${pathFilter ?? "(none)"}\nMode: ${mode}\n\nEmbedding preview:\n${preview}\n\nSearch agent:\n${agentOutput}${logLine}${costSection}\n\nRelevant files:\n${filesList}`;
+
+      pi.sendMessage(
+        { customType: SEARCH_AGENT_COMMAND_MESSAGE_TYPE, content: resultText, display: true },
+        { deliverAs: "steer", triggerTurn: false }
+      );
+    },
+  });
 
   // File discovery and chunking
   async function discoverFiles(
@@ -1047,14 +1519,31 @@ export default function (pi: ExtensionAPI) {
     return [...files].sort();
   }
 
-  async function chunkFiles(files: string[]): Promise<FileChunk[]> {
+  async function chunkFiles(
+    files: string[],
+    onUpdate?: (message: string) => void
+  ): Promise<FileChunk[]> {
     const chunks: FileChunk[] = [];
+    const totalFiles = files.length;
+    const progressEvery = totalFiles > 0
+      ? Math.max(1, Math.floor(totalFiles / CHUNK_PROGRESS_BUCKETS))
+      : 1;
     
     for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
       const filePath = files[fileIndex];
+
+      if (onUpdate && (fileIndex % progressEvery === 0 || fileIndex + 1 === totalFiles)) {
+        onUpdate(`Chunking files ${fileIndex + 1}/${totalFiles}...`);
+      }
+
       try {
         const content = await fs.promises.readFile(filePath, 'utf-8');
-        if (content.length < 50) continue; // Skip very small files
+        if (content.length < 50) {
+          if (fileIndex % CHUNK_YIELD_EVERY === 0) {
+            await yieldToEventLoop();
+          }
+          continue; // Skip very small files
+        }
         
         const lines = content.split('\n');
         let currentChunk = '';
@@ -1083,6 +1572,10 @@ export default function (pi: ExtensionAPI) {
           } else {
             currentChunk += line + '\n';
           }
+
+          if (i > 0 && i % CHUNK_LINE_YIELD_EVERY === 0) {
+            await yieldToEventLoop();
+          }
         }
         
         // Save final chunk
@@ -1100,7 +1593,7 @@ export default function (pi: ExtensionAPI) {
         // Skip files that can't be read
       }
 
-      if (fileIndex > 0 && fileIndex % CHUNK_YIELD_EVERY === 0) {
+      if (fileIndex % CHUNK_YIELD_EVERY === 0) {
         await yieldToEventLoop();
       }
     }
@@ -1554,7 +2047,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     onUpdate?.(`Found ${files.length} files. Chunking...`);
-    const chunks = await chunkFiles(files);
+    const chunks = await chunkFiles(files, onUpdate);
 
     onUpdate?.(`Created ${chunks.length} chunks. Generating embeddings...`);
     const chunksWithEmbeddings = await generateEmbeddings(
@@ -1665,12 +2158,12 @@ Return a short answer and a file list.`;
       }))
     }),
 
-    async execute(toolCallId, params, onUpdate, ctx, signal) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       if (!await initializeOpenAI(ctx)) {
         return {
           content: [{
             type: "text",
-            text: "Failed to initialize OpenAI client."
+            text: getOpenAIInitError()
           }],
           isError: true
         };
@@ -1755,6 +2248,38 @@ ${preview}`;
         }
       };
     },
+
+    renderCall(args, theme) {
+      const queryPreview = args.query.length > 40
+        ? args.query.substring(0, 40) + "..."
+        : args.query;
+
+      let text =
+        theme.fg("toolTitle", "🔎 local_embedding_search ") +
+        theme.fg("accent", `"${queryPreview}"`);
+
+      if (args.path) {
+        text += theme.fg("muted", ` (path: ${args.path})`);
+      }
+
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, _options, theme) {
+      if (result.isError) {
+        return new Text(theme.fg("error", "✗ Embedding search failed"), 0, 0);
+      }
+
+      const details = result.details as any;
+      const matchCount = Array.isArray(details?.matches) ? details.matches.length : 0;
+      const suffix = matchCount === 1 ? "" : "s";
+
+      return new Text(
+        theme.fg("success", "✓ ") + theme.fg("dim", `${matchCount} file${suffix} matched`),
+        0,
+        0
+      );
+    },
   });
 
   if (!IS_SUBAGENT) {
@@ -1783,12 +2308,12 @@ ${preview}`;
         }))
       }),
 
-      async execute(toolCallId, params, onUpdate, ctx, signal) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!await initializeOpenAI(ctx)) {
           return {
             content: [{
               type: "text",
-              text: "Failed to initialize OpenAI client."
+              text: getOpenAIInitError()
             }],
             isError: true
           };
@@ -1934,6 +2459,46 @@ ${filesList}`;
           }
         };
       },
+
+      renderCall(args, theme) {
+        const queryPreview = args.query.length > 40
+          ? args.query.substring(0, 40) + "..."
+          : args.query;
+
+        let text =
+          theme.fg("toolTitle", "🔍 search_agent ") +
+          theme.fg("accent", `"${queryPreview}"`);
+
+        if (args.path) {
+          text += theme.fg("muted", ` (path: ${args.path})`);
+        }
+
+        const extraQueries = Array.isArray(args.queryExtrapolation)
+          ? args.queryExtrapolation.filter((q) => typeof q === "string" && q.trim().length > 0).length
+          : 0;
+
+        if (extraQueries > 0) {
+          text += theme.fg("muted", ` (+${extraQueries} extrapolated)`);
+        }
+
+        return new Text(text, 0, 0);
+      },
+
+      renderResult(result, _options, theme) {
+        if (result.isError) {
+          return new Text(theme.fg("error", "✗ Search agent failed"), 0, 0);
+        }
+
+        const details = result.details as any;
+        const matchCount = Array.isArray(details?.matches) ? details.matches.length : 0;
+        const suffix = matchCount === 1 ? "" : "s";
+
+        return new Text(
+          theme.fg("success", "✓ ") + theme.fg("dim", `${matchCount} file${suffix} matched`),
+          0,
+          0
+        );
+      },
     });
   }
 
@@ -1957,12 +2522,12 @@ ${filesList}`;
       }))
     }),
 
-    async execute(toolCallId, params, onUpdate, ctx, signal) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       if (!await initializeOpenAI(ctx)) {
         return {
           content: [{ 
             type: "text", 
-            text: "Failed to initialize OpenAI client. Check OPENAI_API_KEY." 
+            text: getOpenAIInitError()
           }],
           isError: true
         };
@@ -2006,7 +2571,9 @@ ${filesList}`;
       });
 
       // Chunk files
-      const chunks = await chunkFiles(files);
+      const chunks = await chunkFiles(files, (message) => {
+        onUpdate?.({ content: [{ type: "text", text: `🔪 ${message}` }] });
+      });
       
       onUpdate?.({ 
         content: [{ 
@@ -2091,7 +2658,7 @@ ${filesList}`;
       // No existing index, create new one
       onUpdate?.("No existing index found, creating new index...");
       const files = await discoverFiles(cwd, patterns, onUpdate);
-      const chunks = await chunkFiles(files);
+      const chunks = await chunkFiles(files, onUpdate);
       const chunksWithEmbeddings = await generateEmbeddings(chunks);
       
       const metadata: IndexMetadata = {
@@ -2153,12 +2720,16 @@ ${filesList}`;
 
     // Process new files
     onUpdate?.(`Processing ${newFiles.length} new files...`);
-    const newChunks = await chunkFiles(newFiles);
+    const newChunks = await chunkFiles(newFiles, (message) => {
+      onUpdate?.(`Chunking new files: ${message}`);
+    });
     const newChunksWithEmbeddings = await generateEmbeddings(newChunks);
 
     // Process modified files
     onUpdate?.(`Processing ${modifiedFiles.length} modified files...`);
-    const modifiedChunks = await chunkFiles(modifiedFiles);
+    const modifiedChunks = await chunkFiles(modifiedFiles, (message) => {
+      onUpdate?.(`Chunking modified files: ${message}`);
+    });
     const modifiedChunksWithEmbeddings = await generateEmbeddings(modifiedChunks);
 
     // Combine chunks
@@ -2205,12 +2776,12 @@ ${filesList}`;
       }))
     }),
 
-    async execute(toolCallId, params, onUpdate, ctx, signal) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       if (!await initializeOpenAI(ctx)) {
         return {
           content: [{ 
             type: "text", 
-            text: "Failed to initialize OpenAI client." 
+            text: getOpenAIInitError()
           }],
           details: { query: params.query, embeddingMatches: 0, relevantFiles: [] },
           isError: true
@@ -2242,7 +2813,9 @@ ${filesList}`;
         const files = await discoverFiles(cwd, DEFAULT_PATTERNS, (message) => {
           onUpdate?.({ content: [{ type: "text", text: `🔍 ${message}` }] });
         });
-        const chunks = await chunkFiles(files);
+        const chunks = await chunkFiles(files, (message) => {
+          onUpdate?.({ content: [{ type: "text", text: `🔪 ${message}` }] });
+        });
         
         onUpdate?.({ 
           content: [{ 
@@ -2553,8 +3126,21 @@ Be concise but comprehensive. Use markdown formatting.`;
       let text = theme.fg("toolTitle", "🔍 semantic_search ") + 
                  theme.fg("accent", `"${queryPreview}"`);
       
-      if (args.processWith) {
-        text += theme.fg("muted", ` → ${args.processWith}`);
+      if ((args as any).processWith) {
+        const processWith = (args as any).processWith;
+        let processWithLabel: string;
+
+        if (typeof processWith === "string") {
+          processWithLabel = processWith;
+        } else {
+          try {
+            processWithLabel = JSON.stringify(processWith);
+          } catch {
+            processWithLabel = String(processWith);
+          }
+        }
+
+        text += theme.fg("muted", ` → ${processWithLabel}`);
       }
       
       return new Text(text, 0, 0);
@@ -2570,9 +3156,11 @@ Be concise but comprehensive. Use markdown formatting.`;
         return new Text(theme.fg("success", "✓ Search finished"), 0, 0);
       }
 
-      const fileCount = Array.isArray(details.relevantFiles) 
-        ? details.relevantFiles.length 
-        : details.relevantFiles || 0;
+      const fileCount = Array.isArray(details.relevantFiles)
+        ? details.relevantFiles.length
+        : typeof details.relevantFiles === "number"
+          ? details.relevantFiles
+          : 0;
       
       let text = theme.fg("success", "✓ Found ") + 
                  theme.fg("dim", `${fileCount} relevant files`);
@@ -2588,21 +3176,18 @@ Be concise but comprehensive. Use markdown formatting.`;
     description: "Interactive semantic search interface",
     handler: async (_args, ctx) => {
       if (!await initializeOpenAI(ctx)) {
-        ctx.ui.notify("OpenAI API key not found", "error");
         return;
       }
 
       // Check if index exists
       if (!indexExists(ctx.cwd)) {
+        const options = ["Create new index", "Cancel"];
         const selectedIndex = await ctx.ui.select(
           "No semantic index found. What would you like to do?",
-          [
-            { value: "create", label: "Create new index", description: "Build semantic index for this directory" },
-            { value: "cancel", label: "Cancel", description: "Exit without creating index" }
-          ]
+          options
         );
 
-        if (selectedIndex === "create") {
+        if (selectedIndex === options[0]) {
           ctx.ui.setEditorText("Use semantic_index tool to create the index first");
         }
         return;
@@ -2711,7 +3296,7 @@ Return only the processed analysis, no explanations about your process.`;
   }
 
   async function showSearchInterface(ctx: ExtensionContext, indexMeta: IndexMetadata) {
-    await ctx.ui.custom((tui, theme, done) => {
+    await ctx.ui.custom((tui, theme, _keybindings, done) => {
       let selectedOption = 0;
       let searchQuery = '';
       let searchBox = false;
@@ -2723,7 +3308,7 @@ Return only the processed analysis, no explanations about your process.`;
         { value: 'done', label: '✅ Done', description: 'Exit search interface' }
       ];
 
-      function render(): string[] {
+      function render(width: number): string[] {
         const container = new Container();
         
         // Header
@@ -2765,7 +3350,7 @@ Return only the processed analysis, no explanations about your process.`;
         }
         
         
-        return container.render(tui.getWidth());
+        return container.render(width);
       }
 
       function handleInput(data: string): void {
@@ -2774,14 +3359,14 @@ Return only the processed analysis, no explanations about your process.`;
             searchBox = false;
             searchQuery = '';
           } else {
-            done();
+            done(undefined);
           }
         } else if (searchBox) {
           // Handle search input
           if (matchesKey(data, Key.enter) && searchQuery.trim()) {
             // Trigger search
             ctx.ui.setEditorText(`semantic_search(query: "${searchQuery.trim()}")`);
-            done();
+            done(undefined);
           } else if (matchesKey(data, Key.backspace)) {
             searchQuery = searchQuery.slice(0, -1);
           } else if (data.length === 1 && searchQuery.length < 100) {
@@ -2809,7 +3394,7 @@ Return only the processed analysis, no explanations about your process.`;
                 showIndexStats(ctx, indexMeta);
                 break;
               case 'done':
-                done();
+                done(undefined);
                 break;
             }
           }
@@ -2831,11 +3416,7 @@ Return only the processed analysis, no explanations about your process.`;
     
     const selectedIndex = await ctx.ui.select(
       "Recent searches:",
-      searchHistory.map(query => ({
-        value: query,
-        label: query,
-        description: "Search again with this query"
-      }))
+      searchHistory
     );
     
     if (selectedIndex) {
@@ -2848,10 +3429,6 @@ Return only the processed analysis, no explanations about your process.`;
       `Index stats: ${metadata.fileCount} files, ${metadata.chunkCount} chunks, created ${new Date(metadata.createdAt).toLocaleDateString()}`,
       "info"
     );
-  }
-
-  if (IS_SUBAGENT) {
-    pi.setActiveTools(["read", "local_embedding_search"]);
   }
 
   }
